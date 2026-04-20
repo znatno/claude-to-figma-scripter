@@ -37,6 +37,10 @@ SCREENSHOT_PATH = DIR / "result.png"
 FIFO_PATH = Path("/tmp/claude-figma.fifo")
 LOG_PATH = Path("/tmp/claude-figma.log")
 
+# Modifier key for shortcuts (Cmd on macOS, Ctrl elsewhere). Figma's web UI follows
+# the OS convention, and Playwright does not auto-map "Control" → "Meta" on darwin.
+MOD = "Meta" if sys.platform == "darwin" else "Control"
+
 # URL pattern meaning "logged in and on a Figma document/dashboard".
 LOGGED_IN_URL = re.compile(r"figma\.com/(design|file|files|recent|drafts|community|proto)")
 
@@ -62,7 +66,7 @@ async def open_plugin(page, plugin_name: str):
     await page.wait_for_timeout(500)
 
     # Open Quick Actions
-    await page.keyboard.press("Control+/")
+    await page.keyboard.press(f"{MOD}+/")
     await page.wait_for_timeout(1500)
 
     # Type plugin name
@@ -98,7 +102,7 @@ async def reopen_scripter(page):
     await page.wait_for_timeout(500)
 
     for attempt in range(3):
-        await page.keyboard.press("Control+/")
+        await page.keyboard.press(f"{MOD}+/")
         await page.wait_for_timeout(1000)
         await page.keyboard.type("Scripter", delay=50)
         await page.wait_for_timeout(1000)
@@ -131,7 +135,7 @@ async def scripter_exec(page, code: str):
     await f4.locator('.view-lines').click(force=True)
     await page.wait_for_timeout(300)
     await page.evaluate("(t) => navigator.clipboard.writeText(t)", code)
-    await page.keyboard.press("Control+v")
+    await page.keyboard.press(f"{MOD}+v")
     await page.wait_for_timeout(300)
     await f4.get_by_title("Run  (Ctrl+Return)").click()
     await page.wait_for_timeout(2000)
@@ -200,7 +204,7 @@ async def serve(url: str, email: str = None, password: str = None):
 
         # --- Open Scripter ---------------------------------------------
         for attempt in range(3):
-            await page.keyboard.press("Control+/")
+            await page.keyboard.press(f"{MOD}+/")
             await page.wait_for_timeout(1000)
             await page.keyboard.type("Scripter", delay=50)
             await page.wait_for_timeout(1000)
