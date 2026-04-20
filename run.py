@@ -130,14 +130,21 @@ async def scripter_exec(page, code: str):
         .frame_locator('iframe[name="Inner Plugin Iframe"]')
         .frame_locator('#iframe0')
     )
-    await f4.locator('[title="New script"]').click(force=True)
-    await page.wait_for_timeout(500)
+    # Focus the editor, select-all, then paste — this replaces the current script
+    # content regardless of what was in there. Avoids the flaky "New script" button
+    # and prevents the new code from being appended to the previous script or the
+    # Scripter intro text.
     await f4.locator('.view-lines').click(force=True)
     await page.wait_for_timeout(300)
+    await page.keyboard.press(f"{MOD}+a")
+    await page.wait_for_timeout(150)
     await page.evaluate("(t) => navigator.clipboard.writeText(t)", code)
     await page.keyboard.press(f"{MOD}+v")
     await page.wait_for_timeout(300)
-    await f4.get_by_title("Run  (Ctrl+Return)").click()
+    # Trigger Run via keyboard shortcut — editor still has focus from the paste.
+    # More robust than clicking the Run button (title text varies: "Ctrl+Return"
+    # on Linux/Windows, "Cmd+Return" / localized on macOS).
+    await page.keyboard.press(f"{MOD}+Enter")
     await page.wait_for_timeout(2000)
     await page.screenshot(path=str(SCREENSHOT_PATH), scale="css", type="png")
 
