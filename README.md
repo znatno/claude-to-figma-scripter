@@ -1,6 +1,8 @@
 # claude-to-figma-scripter
 
-AI-driven Figma design automation. Claude Code writes Figma Plugin API scripts, a persistent Playwright/Firefox session pastes them into the Scripter plugin, and the result appears on the Figma canvas.
+AI-driven Figma design automation. Any LLM coding assistant writes Figma Plugin API scripts, a persistent Playwright/Firefox session pastes them into the Scripter plugin, and the result appears on the Figma canvas.
+
+> **AI agents:** read [`AGENTS.md`](AGENTS.md) — tool-agnostic workflow usable from Claude Code, Cursor, Aider, Windsurf, Continue.dev, Copilot, or any model API client.
 
 ## How it works
 
