@@ -32,7 +32,8 @@ cat > "$SCRIPT" <<JS
 JS
 
 echo "running smoketest → expecting '$MARKER' in stdout"
-OUT="$("$FIGMA_RUN" "$SCRIPT" 2>&1)"
+# --raw skips helpers/profile prepending; smoketest only verifies IPC round-trip.
+OUT="$("$FIGMA_RUN" --raw "$SCRIPT" 2>&1)"
 rc=$?
 
 echo "$OUT"

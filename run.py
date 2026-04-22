@@ -70,35 +70,92 @@ MOD = "Meta" if sys.platform == "darwin" else "Control"
 LOGGED_IN_URL = re.compile(r"figma\.com/(design|file|files|recent|drafts|community|proto)")
 
 
+async def _reset_tool(page) -> None:
+    """Force the Figma canvas out of any active creation tool.
+
+    Why: letters like R (rectangle), T (text), F (frame), P (pen) are
+    Figma canvas shortcuts. If a keystroke leaked to the canvas in a
+    prior step (e.g. "Scripter" → "r" activates rectangle tool when
+    Quick Actions never opened), the next mouse click drops a 100×100
+    primitive at the click location. Pressing Escape + V restores the
+    Move tool so clicks and key-combos do not create artifacts.
+    """
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(80)
+    await page.keyboard.press("v")
+    await page.wait_for_timeout(80)
+
+
+async def click_canvas_safe(page, x: float, y: float) -> None:
+    """Click at canvas coordinates only after resetting to the Move tool.
+
+    Use this for any click on the Figma canvas area; never call
+    ``page.mouse.click`` directly on canvas coords. See ``_reset_tool``
+    for the rationale (keystroke-leak → stray rectangle).
+    """
+    await _reset_tool(page)
+    await page.mouse.click(x, y)
+
+
+async def open_quick_actions(page, attempts: int = 3) -> bool:
+    """Open Figma Quick Actions (Cmd+/) and verify the input is focused.
+
+    Returns True iff an input element became focused on the main page
+    (i.e. the Quick Actions search field). If verification fails on
+    every attempt, returns False. The caller MUST NOT type afterwards
+    when False is returned — typing blind is how we end up with a
+    stray 100×100 rectangle on the user's canvas.
+    """
+    for attempt in range(attempts):
+        # Reset tool + clear any open plugin / dialog first.
+        await _reset_tool(page)
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(120)
+        await page.keyboard.press(f"{MOD}+/")
+        # Poll briefly for an input/textbox to gain focus. Figma's Quick
+        # Actions input is the only element that gets focus from Cmd+/ on
+        # the main page, so checking active element tag is sufficient.
+        for _ in range(15):  # 15 * 80ms = 1.2s
+            await page.wait_for_timeout(80)
+            try:
+                tag = await page.evaluate(
+                    "() => (document.activeElement && document.activeElement.tagName) || ''"
+                )
+            except Exception:
+                tag = ""
+            if tag in ("INPUT", "TEXTAREA"):
+                return True
+        # Didn't open — clean up before retry.
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(200)
+        print(f"Quick Actions open attempt {attempt + 1} failed; retrying…",
+              file=sys.stderr)
+    return False
+
+
 async def open_plugin(page, plugin_name: str):
     """Open a Figma plugin via Quick Actions.
 
     Supports 'PluginName > Action' syntax to select a specific action.
-    Example: 'Propstar > Create property table'
+    Example: 'Propstar > Create property table'.
+
+    Refuses to type the plugin name if Quick Actions did not open
+    (otherwise letters leak to the canvas and can draw a rectangle).
     """
     parts = [p.strip() for p in plugin_name.split(">")]
     name = parts[0]
     action = parts[1] if len(parts) > 1 else None
 
-    # Close any open plugin/dialog
-    await page.keyboard.press("Escape")
-    await page.wait_for_timeout(500)
-    await page.keyboard.press("Escape")
-    await page.wait_for_timeout(500)
+    if not await open_quick_actions(page):
+        print(
+            f"Error: Quick Actions never opened; refusing to type '{name}' on canvas",
+            file=sys.stderr,
+        )
+        return
 
-    # Click on canvas to ensure focus
-    await page.mouse.click(100, 300)
-    await page.wait_for_timeout(500)
-
-    # Open Quick Actions
-    await page.keyboard.press(f"{MOD}+/")
-    await page.wait_for_timeout(1500)
-
-    # Type plugin name
+    # Quick Actions is verified focused — safe to type.
     await page.keyboard.type(name, delay=50)
-    await page.wait_for_timeout(1500)
-
-    # Press Enter to open the plugin first
+    await page.wait_for_timeout(1000)
     await page.keyboard.press("Enter")
     await page.wait_for_timeout(3000)
 
@@ -120,17 +177,20 @@ async def open_plugin(page, plugin_name: str):
 
 
 async def reopen_scripter(page):
-    """Re-open Scripter plugin after using another plugin."""
-    await page.keyboard.press("Escape")
-    await page.wait_for_timeout(500)
-    await page.mouse.click(100, 300)
-    await page.wait_for_timeout(500)
+    """Re-open Scripter plugin after using another plugin.
 
+    Uses the verified ``open_quick_actions`` helper so "Scripter" is
+    never typed on the bare canvas (which would toggle S=slice then
+    R=rectangle and queue a stray rectangle on the next canvas click).
+    """
     for attempt in range(3):
-        await page.keyboard.press(f"{MOD}+/")
-        await page.wait_for_timeout(1000)
+        if not await open_quick_actions(page):
+            print(f"Scripter reopen attempt {attempt + 1}: Quick Actions did not open",
+                  file=sys.stderr)
+            continue
+
         await page.keyboard.type("Scripter", delay=50)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(800)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(3000)
 
@@ -144,7 +204,7 @@ async def reopen_scripter(page):
             await page.keyboard.press("Escape")
             await page.wait_for_timeout(1000)
 
-    print("Warning: could not re-open Scripter")
+    print("Warning: could not re-open Scripter", file=sys.stderr)
 
 
 def scripter_frame(page):
@@ -215,14 +275,16 @@ async def close_scripter(page):
             continue
 
     # Fallback: locate the Scripter iframe element and click near its
-    # top-right — that's where Figma renders the close "x".
+    # top-right — that's where Figma renders the close "x". Use the
+    # canvas-safe wrapper so we never drop a rectangle if some prior
+    # step left the canvas in a non-Move tool state.
     try:
         iframe_el = page.locator('iframe[title="Plugin: Scripter"]').first
         box = await iframe_el.bounding_box()
         if box:
             x = box["x"] + box["width"] - 18
             y = box["y"] + 20
-            await page.mouse.click(x, y)
+            await click_canvas_safe(page, x, y)
             await page.wait_for_timeout(400)
             if not await is_scripter_open(page):
                 return
@@ -481,18 +543,14 @@ async def scripter_exec(page, code: str, timeout_s: float = 30.0, quiet: bool = 
     await page.wait_for_timeout(150)
 
     # 4. Replace the editor buffer atomically via Monaco's setValue API on
-    #    the visible editor. One reopen retry is allowed; after that we
-    #    HARD-FAIL rather than "best-effort" paste into the canvas.
+    #    the visible editor. Fail-fast policy: ONE attempt. If the write
+    #    fails we HARD-FAIL rather than retry — retries cascade into many
+    #    Scripter popups for the user. bin/figma-run's exit signals Claude
+    #    to stop and wait for direction.
     replaced = await set_editor_code(page, f4, code)
     if not replaced:
-        print("scripter: editor write failed — reopening Scripter once and retrying",
-              file=sys.stderr)
-        await reopen_scripter(page)
-        f4 = scripter_frame(page)
-        replaced = await set_editor_code(page, f4, code)
-    if not replaced:
-        msg = ("editor write failed after one reopen; refusing to run "
-               "(would risk pasting into canvas)")
+        msg = ("editor write failed on first attempt; refusing to retry "
+               "(would trigger Scripter popups and risk canvas paste)")
         print(f"[run] ABORT — {msg}", file=sys.stderr)
         if not quiet:
             print("STATUS=error")
@@ -637,11 +695,17 @@ async def serve(url: str, email: str = None, password: str = None):
         await page.wait_for_timeout(5000)
 
         # --- Open Scripter ---------------------------------------------
+        # Each attempt verifies Quick Actions opened (via focus on the
+        # input) BEFORE typing "Scripter". Typing blind on the canvas
+        # would activate Figma's R = rectangle tool and leave a
+        # stray 100×100 rectangle on the file.
         for attempt in range(3):
-            await page.keyboard.press(f"{MOD}+/")
-            await page.wait_for_timeout(1000)
+            if not await open_quick_actions(page):
+                print(f"Scripter open attempt {attempt + 1}: Quick Actions did not open",
+                      file=sys.stderr)
+                continue
             await page.keyboard.type("Scripter", delay=50)
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(800)
             await page.keyboard.press("Enter")
             await page.wait_for_timeout(3000)
 
