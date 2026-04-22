@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# figma-run — execute a Figma Plugin API script via Scripter.
+#
+# Usage:
+#   bin/figma-run <script.js>                     send file, print captured output
+#   bin/figma-run --restart <script.js> [URL]     kill + re-ensure first; URL
+#                                                 overrides the saved one
+#   bin/figma-run --keep-open <script.js>         don't close Scripter after
+#
+# Exit status mirrors the script: 0 = STATUS=ok, 1 = STATUS=timeout (after one
+# auto-restart retry) or STATUS=error, 2 = invocation/IO error.
+#
+# Reads FIGMA_URL from env as a last-resort fallback for --restart.
+
+set -uo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON="${PROJECT_DIR}/.venv/bin/python"
+RUN_PY="${PROJECT_DIR}/run.py"
+LOG="/tmp/claude-figma.log"
+FIFO="/tmp/claude-figma.fifo"
+URL_FILE="/tmp/claude-figma.url"
+RESULT="${PROJECT_DIR}/result.png"
+
+restart=0
+keep_open=0
+script=""
+restart_url=""
+for arg in "$@"; do
+  case "$arg" in
+    --restart)   restart=1 ;;
+    --keep-open) keep_open=1 ;;
+    -h|--help)
+      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    --*) echo "error: unknown flag: $arg" >&2; exit 2 ;;
+    *)
+      # Positional args: first is the script, second (restart only) is URL.
+      if [[ -z "$script" ]]; then
+        script="$arg"
+      elif (( restart )) && [[ -z "$restart_url" ]]; then
+        restart_url="$arg"
+      else
+        echo "error: extra argument: $arg" >&2; exit 2
+      fi
+      ;;
+  esac
+done
+
+if [[ -z "$script" ]]; then
+  echo "usage: figma-run [--restart [URL]] [--keep-open] <script.js>" >&2
+  exit 2
+fi
+if [[ ! -f "$script" ]]; then
+  echo "error: script file not found: $script" >&2
+  exit 2
+fi
+if [[ ! -x "$PYTHON" ]]; then
+  echo "error: pinned python missing or not executable: $PYTHON" >&2
+  exit 2
+fi
+
+do_restart() {
+  local url=""
+  if [[ -n "${1:-}" ]]; then
+    url="$1"
+  elif [[ -f "$URL_FILE" ]]; then
+    url="$(cat "$URL_FILE")"
+  elif [[ -n "${FIGMA_URL:-}" ]]; then
+    url="$FIGMA_URL"
+  else
+    echo "error: cannot --restart: no URL given, no $URL_FILE, no FIGMA_URL env" >&2
+    echo "       run once with: $PYTHON $RUN_PY --ensure '<FIGMA_URL>'" >&2
+    return 1
+  fi
+  pkill -f "run.py --serve" 2>/dev/null || true
+  sleep 2
+  rm -f "$FIFO"
+  "$PYTHON" "$RUN_PY" --ensure "$url" || return 1
+}
+
+if (( restart )); then
+  do_restart "$restart_url" || exit 1
+fi
+
+if [[ ! -p "$FIFO" ]]; then
+  echo "error: server not running (no fifo at $FIFO). Start with:" >&2
+  echo "  $PYTHON $RUN_PY --ensure '<FIGMA_URL>' (or export FIGMA_URL)" >&2
+  exit 2
+fi
+
+# Print the captured block for this run and echo STATUS=... lastly.
+# Returns 0 on STATUS=ok, 1 otherwise. Writes STATUS to stdout of caller
+# via a file since bash functions can't return strings.
+STATUS_FILE="$(mktemp)"
+trap 'rm -f "$STATUS_FILE"' EXIT
+
+run_once() {
+  # We can't write a mark into the log: the server holds a non-O_APPEND stdout
+  # fd on the same file, so any append from here gets overwritten by the
+  # server's next write. Instead, remember the log size BEFORE we send and
+  # consume everything that lands after that offset.
+  local before_size
+  before_size="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+  before_size="${before_size// /}"
+
+  "$PYTHON" "$RUN_PY" --file "$script" >/dev/null || {
+    echo "STATUS=error" > "$STATUS_FILE"
+    echo "STATUS=error"
+    echo "error: could not send script to server" >&2
+    return 1
+  }
+
+  # Wait up to 40s for the end-marker to appear in the new log suffix.
+  local deadline=$(( $(date +%s) + 40 ))
+  local run_log=""
+  while [[ $(date +%s) -lt $deadline ]]; do
+    run_log="$(tail -c +$((before_size + 1)) "$LOG" 2>/dev/null || true)"
+    if printf '%s\n' "$run_log" | grep -q "^--- end output ---$"; then
+      break
+    fi
+    sleep 0.3
+  done
+
+  local status
+  status="$(printf '%s\n' "$run_log" | awk -F= '/^STATUS=/{print $2; exit}')"
+  status="${status:-timeout}"
+  echo "STATUS=$status" > "$STATUS_FILE"
+
+  echo "--- output ---"
+  printf '%s\n' "$run_log" | awk '/^--- output ---$/{p=1; next} /^--- end output ---$/{p=0} p'
+  echo "--- result ---"
+  echo "$RESULT"
+  echo "STATUS=$status"
+
+  [[ "$status" == "ok" ]]
+}
+
+run_once
+rc=$?
+
+status="$(cat "$STATUS_FILE" 2>/dev/null | awk -F= '{print $2}')"
+status="${status:-unknown}"
+
+if [[ "$status" == "timeout" ]]; then
+  echo "--- auto-restart (server timed out once) ---" >&2
+  if do_restart "$restart_url" >&2; then
+    run_once
+    rc=$?
+    status="$(cat "$STATUS_FILE" 2>/dev/null | awk -F= '{print $2}')"
+    status="${status:-unknown}"
+  fi
+fi
+
+# Close Scripter so the canvas is visible. Default ON; skip with --keep-open.
+if (( keep_open == 0 )) && [[ "$status" == "ok" ]]; then
+  echo "__close_scripter__" > "$FIFO"
+fi
+
+[[ "$status" == "ok" ]]

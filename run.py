@@ -18,6 +18,7 @@ Server writes `result.png` after each execution and, when Scripter produces outp
 to /tmp/claude-figma.log so --ensure can poll for readiness.
 """
 
+import json
 import os
 import re
 import sys
@@ -36,6 +37,30 @@ STATE_PATH = DIR / ".auth-state.json"
 SCREENSHOT_PATH = DIR / "result.png"
 FIFO_PATH = Path("/tmp/claude-figma.fifo")
 LOG_PATH = Path("/tmp/claude-figma.log")
+URL_PATH = Path("/tmp/claude-figma.url")  # Last URL passed to --ensure (for restarts).
+
+# Accumulates console messages from the whole page (all frames) between runs.
+# scripter_exec clears it before pasting and reads it after running so
+# Scripter's print() — which bridges to console.log — ends up in stdout.
+CONSOLE_BUFFER: list = []
+
+# Console events we never want to forward as script output. Browser feature-
+# policy warnings, Monaco's layout-was-forced notice, Scripter's own timing
+# line, etc. — all noise. Matched as substrings.
+CONSOLE_NOISE = (
+    "Feature Policy:",
+    "Layout was forced",
+    "Quirks Mode",
+    "Clearing and silencing console",
+    "JSHandle@",
+    "[JavaScript Warning:",
+    "[JavaScript Error:",
+    "script took ",  # Scripter's "script took Nms" diagnostic
+)
+
+
+def is_console_noise(text: str) -> bool:
+    return any(noise in text for noise in CONSOLE_NOISE)
 
 # Modifier key for shortcuts (Cmd on macOS, Ctrl elsewhere). Figma's web UI follows
 # the OS convention, and Playwright does not auto-map "Control" → "Meta" on darwin.
@@ -122,43 +147,432 @@ async def reopen_scripter(page):
     print("Warning: could not re-open Scripter")
 
 
-async def scripter_exec(page, code: str):
-    """Paste and run code in Scripter."""
-    f4 = (
+def scripter_frame(page):
+    """Locator for Scripter's inner iframe (4 levels deep)."""
+    return (
         page.frame_locator('iframe[title="Plugin: Scripter"]')
         .frame_locator('iframe[name="Network Plugin Iframe"]')
         .frame_locator('iframe[name="Inner Plugin Iframe"]')
         .frame_locator('#iframe0')
     )
-    # Focus the editor, select-all, then paste — this replaces the current script
-    # content regardless of what was in there. Avoids the flaky "New script" button
-    # and prevents the new code from being appended to the previous script or the
-    # Scripter intro text.
-    await f4.locator('.view-lines').click(force=True)
-    await page.wait_for_timeout(300)
-    await page.keyboard.press(f"{MOD}+a")
-    await page.wait_for_timeout(150)
-    await page.evaluate("(t) => navigator.clipboard.writeText(t)", code)
-    await page.keyboard.press(f"{MOD}+v")
-    await page.wait_for_timeout(300)
-    # Trigger Run via keyboard shortcut — editor still has focus from the paste.
-    # More robust than clicking the Run button (title text varies: "Ctrl+Return"
-    # on Linux/Windows, "Cmd+Return" / localized on macOS).
-    await page.keyboard.press(f"{MOD}+Enter")
-    await page.wait_for_timeout(2000)
-    await page.screenshot(path=str(SCREENSHOT_PATH), scale="css", type="png")
 
-    # Read Scripter output (print() results)
+
+async def is_scripter_open(page) -> bool:
+    """Is the Scripter iframe currently mounted AND usable?
+
+    A stale outer iframe element can linger briefly after ``figma.closePlugin``,
+    so checking count alone returns true when Scripter is actually gone. We
+    also probe for the inner Monaco textarea — if that's missing the iframe
+    is not in a usable state and the caller must reopen.
+    """
     try:
-        output_el = f4.locator('.output-lines, [class*=output], [class*=message]')
-        count = await output_el.count()
-        if count > 0:
-            text = await output_el.first.inner_text()
-            if text.strip():
-                output_path = DIR / "output.txt"
-                output_path.write_text(text.strip())
+        outer = page.locator('iframe[title="Plugin: Scripter"]')
+        if (await outer.count()) == 0:
+            return False
+        f4 = scripter_frame(page)
+        editor = f4.locator('textarea.inputarea').first
+        # Short timeout — if the editor isn't there within 1s the plugin
+        # is unresponsive (closed or mid-reload).
+        await editor.wait_for(state="attached", timeout=1000)
+        return True
+    except Exception:
+        return False
+
+
+async def ensure_scripter_open(page):
+    """If Scripter is closed (e.g. after figma.closePlugin), reopen it."""
+    if await is_scripter_open(page):
+        return
+    print("scripter: reopening (was closed)")
+    await reopen_scripter(page)
+
+
+async def close_scripter(page):
+    """Close Scripter so result.png shows a clean canvas.
+
+    ``figma.closePlugin()`` is intercepted by Scripter (it would kill its own
+    host), so we click Figma's plugin-window close affordance instead. The
+    exact DOM varies with Figma's layout — try a handful of plausible
+    selectors and fall back to clicking the top-right of the Scripter iframe
+    bounding box (Figma's close button is there).
+    """
+    if not await is_scripter_open(page):
+        return
+    # Try a few attribute-based selectors first.
+    for selector in (
+        '[aria-label="Close" i]',
+        '[data-testid*="close" i][class*="plugin" i]',
+        'button[title="Close" i]',
+    ):
+        try:
+            loc = page.locator(selector).first
+            if (await loc.count()) > 0 and await loc.is_visible():
+                await loc.click(timeout=1500)
+                await page.wait_for_timeout(400)
+                if not await is_scripter_open(page):
+                    return
+        except Exception:
+            continue
+
+    # Fallback: locate the Scripter iframe element and click near its
+    # top-right — that's where Figma renders the close "x".
+    try:
+        iframe_el = page.locator('iframe[title="Plugin: Scripter"]').first
+        box = await iframe_el.bounding_box()
+        if box:
+            x = box["x"] + box["width"] - 18
+            y = box["y"] + 20
+            await page.mouse.click(x, y)
+            await page.wait_for_timeout(400)
+            if not await is_scripter_open(page):
+                return
     except Exception:
         pass
+
+    # Last resort: Escape twice often dismisses a focused plugin.
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(200)
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(400)
+
+
+def _norm_ws(s: str) -> str:
+    """Collapse all whitespace and NBSP — used to compare editor DOM vs source."""
+    return re.sub(r"\s+", "", (s or "").replace("\u00a0", " "))
+
+
+async def _monaco_write(textarea, code: str) -> dict:
+    """Write *code* via the visible Monaco editor's model.
+
+    Strategy (no guessing):
+      1. ``monaco.editor.getEditors()`` returns all instantiated editors.
+      2. Pick the one whose container is actually visible — ``offsetParent``
+         is non-null AND client rects have non-zero area. Hidden Scripter
+         tabs are detached from layout.
+      3. If exactly one editor is visible, write to its model.
+      4. If zero or more than one is visible, return a diagnostic and let
+         the caller fail loudly. No heuristic fallback.
+
+    Returns a dict with ``ok`` plus diagnostic fields.
+    """
+    return await textarea.evaluate(
+        """(el, code) => {
+            const win = el.ownerDocument.defaultView;
+            const mon = win && win.monaco;
+            if (!mon || !mon.editor || typeof mon.editor.getEditors !== 'function') {
+                return { ok: false, reason: 'no-monaco-getEditors' };
+            }
+            const editors = mon.editor.getEditors();
+            if (!editors || !editors.length) {
+                return { ok: false, reason: 'no-editors' };
+            }
+            const visible = editors.filter((ed) => {
+                try {
+                    const node = ed.getDomNode && ed.getDomNode();
+                    if (!node) return false;
+                    if (!node.offsetParent && node.ownerDocument.body !== node.offsetParent) {
+                        // offsetParent is null for display:none/detached subtrees
+                        return false;
+                    }
+                    const r = node.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                } catch (e) { return false; }
+            });
+            if (visible.length === 0) {
+                return { ok: false, reason: 'no-visible-editor',
+                         editor_count: editors.length };
+            }
+            if (visible.length > 1) {
+                return { ok: false, reason: 'multiple-visible-editors',
+                         visible_count: visible.length,
+                         editor_count: editors.length };
+            }
+            const ed = visible[0];
+            const model = ed.getModel && ed.getModel();
+            if (!model) {
+                return { ok: false, reason: 'visible-editor-no-model' };
+            }
+            try { model.setValue(code); } catch (e) {
+                return { ok: false, reason: 'setValue-throw:' + e.message };
+            }
+            const got = model.getValue();
+            return { ok: got === code,
+                     reason: got === code ? 'ok' : 'model-readback-mismatch',
+                     got_len: got.length, want_len: code.length,
+                     editor_count: editors.length };
+        }""",
+        code,
+    )
+
+
+async def _verify_visible_matches(f4, code: str) -> dict:
+    """Read back the visible Monaco view-lines and confirm they match *code*.
+
+    Monaco only renders visible rows, so for long scripts we compare just
+    the first N normalised chars from the head. Scripter scripts in this
+    workflow fit on one screen in practice; 120 chars is enough to detect
+    a stale tab (different head) without false-positive mismatches on
+    trailing-whitespace differences.
+    """
+    try:
+        dom_text = await f4.locator('.monaco-editor .view-lines').first.evaluate(
+            """(root) => {
+                const lines = Array.from(root.querySelectorAll('.view-line'));
+                lines.sort((a, b) => (parseFloat(a.style.top) || 0) - (parseFloat(b.style.top) || 0));
+                return lines.map(l => l.innerText).join('\\n');
+            }"""
+        )
+    except Exception as e:
+        return {"ok": False, "reason": f"dom-read-error:{e}"}
+    want = _norm_ws(code)[:120]
+    got = _norm_ws(dom_text)[:120]
+    if not want:
+        return {"ok": False, "reason": "empty-want"}
+    ok = got.startswith(want) or want.startswith(got)
+    return {"ok": ok, "reason": "ok" if ok else "visible-mismatch",
+            "want_head": want[:60], "got_head": got[:60]}
+
+
+async def set_editor_code(page, f4, code: str) -> bool:
+    """Replace the visible Scripter editor's buffer with *code*.
+
+    Safety contract:
+      - Writes ONLY via Monaco's model API on the **visible** editor.
+      - Never uses clipboard + Cmd+V (that escapes to the canvas on focus
+        loss and creates stray frames/rectangles).
+      - On failure, the caller gets a clear False and should NOT proceed
+        to run the script.
+
+    Implicit-return caveat:
+      Scripter rewrites a trailing bare expression with ``return``; a script
+      ending in ``print("…");`` becomes ``returnprint(…)``. Wrap scripts in
+      ``(async () => { … })();``. CLAUDE.md documents this rule.
+
+    Returns True iff both the model readback AND the visible-DOM readback
+    confirm *code* was installed.
+    """
+    textarea = f4.locator('textarea.inputarea').first
+    try:
+        await textarea.wait_for(state="attached", timeout=3000)
+    except Exception:
+        print("[write] FAIL — Scripter textarea not attached", file=sys.stderr)
+        return False
+
+    try:
+        result = await _monaco_write(textarea, code)
+    except Exception as e:
+        result = {"ok": False, "reason": f"evaluate-error:{e}"}
+
+    if not result.get("ok"):
+        print(f"[write] FAIL — {result.get('reason')} "
+              f"(editors={result.get('editor_count')}, visible={result.get('visible_count')})",
+              file=sys.stderr)
+        return False
+
+    # Give Monaco a tick to flush the new value into the visible DOM.
+    await page.wait_for_timeout(100)
+
+    verify = await _verify_visible_matches(f4, code)
+    if not verify.get("ok"):
+        print(
+            f"[verify] FAIL — {verify.get('reason')} "
+            f"want_head={verify.get('want_head')!r} got_head={verify.get('got_head')!r}",
+            file=sys.stderr,
+        )
+        return False
+
+    print(f"[write] ok — {result.get('want_len')} chars → visible Monaco editor "
+          f"(of {result.get('editor_count')} total)")
+    print(f"[verify] ok — visible DOM matches first {len(verify.get('want_head') or '')} normalised chars")
+    return True
+
+
+async def scrape_scripter_output(page, f4) -> str:
+    """Return the text content of Scripter's inline print() widgets.
+
+    Scripter renders each ``print(x)`` call as an inline Monaco content-widget
+    above the source line, NOT as a bottom panel. The widget DOM contains the
+    stringified value as regular text. We walk the content-widgets container
+    and concatenate.
+    """
+    if not await is_scripter_open(page):
+        return ""
+    try:
+        # Monaco's content widgets are rendered into ``.contentWidgets``.
+        # Each Scripter print-result is a child div whose text is the value.
+        widgets = f4.locator('.monaco-editor .contentWidgets > div')
+        n = await widgets.count()
+        lines = []
+        for i in range(n):
+            try:
+                t = (await widgets.nth(i).inner_text()).strip()
+            except Exception:
+                continue
+            if not t:
+                continue
+            # Filter out editor chrome (suggest widget, hover, find etc.)
+            if any(s in t.lower() for s in ("suggest", "parameter hint", "find", "lightbulb")):
+                continue
+            lines.append(t)
+        return "\n".join(lines).strip()
+    except Exception:
+        return ""
+
+
+async def wait_for_run_output(page, f4, timeout_s: float = 30.0) -> str:
+    """Poll for script output via console buffer + DOM scrape.
+
+    Returns the captured text once it has been stable for ~500ms, or whatever
+    we have at ``timeout_s``. Called immediately after Cmd+Enter; the deadline
+    must be large enough for heavy build scripts to finish.
+    """
+    deadline = time.time() + timeout_s
+    last_sig = ""
+    stable_at: float | None = None
+
+    while time.time() < deadline:
+        # Console capture — bridged from Scripter's print() / console.log.
+        console_text = "\n".join(CONSOLE_BUFFER).strip()
+        # DOM scrape — fallback when console doesn't bubble.
+        dom_text = await scrape_scripter_output(page, f4)
+
+        combined = console_text or dom_text
+        sig = (len(console_text), len(dom_text), combined)
+
+        if combined:
+            if sig == last_sig:
+                if stable_at and (time.time() - stable_at) >= 0.5:
+                    return combined
+            else:
+                last_sig = sig
+                stable_at = time.time()
+
+        await asyncio.sleep(0.15)
+
+    # Timeout — return best-effort.
+    return "\n".join(CONSOLE_BUFFER).strip() or await scrape_scripter_output(page, f4)
+
+
+async def scripter_exec(page, code: str, timeout_s: float = 30.0, quiet: bool = False) -> str:
+    """Paste and run code in Scripter, capture print() output, emit STATUS.
+
+    Returns the captured output text. Output contract (read by
+    ``bin/figma-run``):
+        STATUS=ok|timeout|error
+        --- output ---
+        <captured text>
+        --- end output ---
+        OK → /path/to/result.png
+
+    ``quiet=True`` suppresses the STATUS/output block (used by the internal
+    hydration probe so startup logs stay clean).
+    """
+    f4 = scripter_frame(page)
+
+    # 1. Scripter may have been closed by figma.closePlugin() in the previous
+    #    script. Reopen transparently so the agent doesn't have to care.
+    await ensure_scripter_open(page)
+
+    # 2. Clear console buffer so this run starts clean.
+    CONSOLE_BUFFER.clear()
+
+    # 3. Dismiss leftover popups (autocomplete from the previous run).
+    await page.keyboard.press("Escape")
+    await page.wait_for_timeout(150)
+
+    # 4. Replace the editor buffer atomically via Monaco's setValue API on
+    #    the visible editor. One reopen retry is allowed; after that we
+    #    HARD-FAIL rather than "best-effort" paste into the canvas.
+    replaced = await set_editor_code(page, f4, code)
+    if not replaced:
+        print("scripter: editor write failed — reopening Scripter once and retrying",
+              file=sys.stderr)
+        await reopen_scripter(page)
+        f4 = scripter_frame(page)
+        replaced = await set_editor_code(page, f4, code)
+    if not replaced:
+        msg = ("editor write failed after one reopen; refusing to run "
+               "(would risk pasting into canvas)")
+        print(f"[run] ABORT — {msg}", file=sys.stderr)
+        if not quiet:
+            print("STATUS=error")
+            print("--- output ---")
+            print(f"(aborted: {msg})")
+            print("--- end output ---")
+        return ""
+
+    # 5. Focus the editor's inputarea so Cmd+Enter targets Monaco. Then
+    #    verify focus actually landed on the textarea inside the Scripter
+    #    iframe — if it didn't, pressing Cmd+Enter could hit the Figma
+    #    canvas instead (and any stray keystrokes could move the page).
+    try:
+        await f4.locator('textarea.inputarea').first.focus(timeout=2000)
+    except Exception:
+        try:
+            await f4.locator('.monaco-editor .view-lines').first.click(timeout=2000)
+        except Exception:
+            pass
+    await page.wait_for_timeout(120)
+
+    focus_ok = False
+    try:
+        focus_info = await f4.locator('textarea.inputarea').first.evaluate(
+            """(el) => {
+                const active = el.ownerDocument.activeElement;
+                return {
+                    is_textarea: active === el,
+                    active_tag: active ? active.tagName : null,
+                    active_cls: active && active.className ? String(active.className).slice(0, 80) : null,
+                };
+            }"""
+        )
+        focus_ok = bool(focus_info.get("is_textarea"))
+    except Exception as e:
+        focus_info = {"error": str(e)}
+    if not focus_ok:
+        msg = f"focus not on Scripter textarea (active={focus_info}); refusing to press Cmd+Enter"
+        print(f"[focus] FAIL — {msg}", file=sys.stderr)
+        print(f"[run] ABORT — {msg}", file=sys.stderr)
+        if not quiet:
+            print("STATUS=error")
+            print("--- output ---")
+            print(f"(aborted: {msg})")
+            print("--- end output ---")
+        return ""
+    print("[focus] ok — textarea.inputarea inside Scripter iframe has focus")
+
+    # 6. Run. Cmd+Enter — we just verified focus is on the Scripter textarea,
+    #    so this keystroke cannot leak to the Figma canvas.
+    await page.keyboard.press(f"{MOD}+Enter")
+    print("[run] Cmd+Enter dispatched")
+
+    # 7. Poll adaptively for output. Returns quickly for simple scripts,
+    #    waits up to ``timeout_s`` for heavy builds.
+    output = await wait_for_run_output(page, f4, timeout_s=timeout_s)
+
+    status = "ok" if output else "timeout"
+    source = "console" if "\n".join(CONSOLE_BUFFER).strip() else ("dom" if output else "none")
+    print(f"[output] source={source}, status={status}, len={len(output)}")
+
+    # 8. Persist output.txt for compatibility; emit to stdout for the wrapper.
+    if output:
+        (DIR / "output.txt").write_text(output)
+    if not quiet:
+        print(f"STATUS={status}")
+        print("--- output ---")
+        print(output or f"(no print() output captured within {timeout_s:.0f}s)")
+        print("--- end output ---")
+
+    # 9. Screenshot after script finishes. If the script called
+    #    figma.closePlugin() (directly or via setTimeout), wait a beat so
+    #    the plugin UI is actually gone before the shot.
+    await page.wait_for_timeout(500)
+    try:
+        await page.screenshot(path=str(SCREENSHOT_PATH), scale="css", type="png")
+    except Exception as e:
+        print(f"screenshot failed: {e}", file=sys.stderr)
+
+    return output
 
 
 async def serve(url: str, email: str = None, password: str = None):
@@ -176,6 +590,19 @@ async def serve(url: str, email: str = None, password: str = None):
             ctx = await browser.new_context()
 
         page = await ctx.new_page()
+
+        # Capture console events from all frames into CONSOLE_BUFFER so
+        # scripter_exec can read print() output. Scripter's ``print`` bridges
+        # to ``console.log`` inside the plugin iframe; Playwright's page-level
+        # listener bubbles those up regardless of iframe nesting.
+        def _on_console(msg):
+            try:
+                text = msg.text
+            except Exception:
+                return
+            if text and not is_console_noise(text):
+                CONSOLE_BUFFER.append(text)
+        page.on("console", _on_console)
 
         # --- Login ------------------------------------------------------
         if not STATE_PATH.exists():
@@ -232,6 +659,66 @@ async def serve(url: str, email: str = None, password: str = None):
             await browser.close()
             return
 
+        # --- Hydration wait --------------------------------------------
+        # Scripter being mounted does NOT mean Figma has finished loading the
+        # file. After a fresh browser start the canvas may still be hydrating,
+        # which makes ``figma.currentPage.children`` briefly empty and
+        # previously looked like file corruption. Probe via a tiny Scripter
+        # script that prints the child count; retry until it responds.
+        # Must be IIFE-wrapped: Scripter's implicit-return transform breaks
+        # bare top-level statements installed via setValue (produces
+        # ``'returnprint' is not defined``). See ``set_editor_code`` docstring.
+        probe = "(async () => { print('HYDRATED:' + figma.currentPage.children.length); })();"
+        hydrated = False
+        for attempt in range(6):
+            try:
+                text = await scripter_exec(page, probe, timeout_s=5.0, quiet=True)
+            except Exception as e:
+                print(f"hydration probe error (attempt {attempt + 1}): {e}")
+                await page.wait_for_timeout(2000)
+                continue
+            if text and "HYDRATED:" in text:
+                print(f"hydration ok — {text.strip().splitlines()[-1]}")
+                hydrated = True
+                break
+            print(f"hydration probe empty (attempt {attempt + 1}); retrying…")
+            await page.wait_for_timeout(2000)
+        if not hydrated:
+            print(
+                "warning: hydration probe never responded; proceeding anyway",
+                file=sys.stderr,
+            )
+
+        # --- URL node/page enforcement ---------------------------------
+        # Figma's stored session state can override the URL's requested
+        # page — users pass a URL with ``node-id=519-12368`` expecting the
+        # viewport to land on that node, then see a different page instead.
+        # Parse node-id out of the URL and force the active page + viewport
+        # to match.
+        m = re.search(r'node-id=([0-9A-Za-z_:-]+)', url)
+        if m:
+            node_id = m.group(1).replace('-', ':', 1)
+            nav_script = (
+                "(async () => {\n"
+                "  try {\n"
+                "    await figma.loadAllPagesAsync();\n"
+                f"    const n = await figma.getNodeByIdAsync({json.dumps(node_id)});\n"
+                "    if (!n) { print('NAV_NO_NODE'); return; }\n"
+                "    let p = n; while (p && p.type !== 'PAGE') p = p.parent;\n"
+                "    if (p && figma.currentPage !== p) { figma.currentPage = p; }\n"
+                "    figma.viewport.scrollAndZoomIntoView([n]);\n"
+                "    print('NAVIGATED:' + (p ? p.name : '?'));\n"
+                "  } catch (e) { print('NAV_ERR:' + e.message); }\n"
+                "})();"
+            )
+            try:
+                text = await scripter_exec(page, nav_script, timeout_s=10.0, quiet=True)
+                if text:
+                    last = text.strip().splitlines()[-1]
+                    print(f"url-node nav: {last}")
+            except Exception as e:
+                print(f"url-node nav failed: {e}", file=sys.stderr)
+
         print(f"Ready. Send code to {FIFO_PATH}")
         print(f"  echo 'figma code' > {FIFO_PATH}")
 
@@ -257,10 +744,22 @@ async def serve(url: str, email: str = None, password: str = None):
                 except Exception as e:
                     print(f"Reopen error: {e}", file=sys.stderr)
                 continue
+            if code == "__close_scripter__":
+                try:
+                    await close_scripter(page)
+                    # Move mouse far off-canvas so the "Close" tooltip from the
+                    # hover doesn't end up in the screenshot.
+                    await page.mouse.move(5, 5)
+                    await page.wait_for_timeout(400)
+                    await page.screenshot(path=str(SCREENSHOT_PATH), scale="css", type="png")
+                except Exception as e:
+                    print(f"Close error: {e}", file=sys.stderr)
+                continue
             try:
                 await scripter_exec(page, code)
                 print(f"OK → {SCREENSHOT_PATH}")
             except Exception as e:
+                print(f"STATUS=error")
                 print(f"Error: {e}", file=sys.stderr)
 
         await browser.close()
@@ -301,6 +800,8 @@ def ensure_server(url: str, email: str = None, password: str = None) -> int:
 
     # Reset log so readiness polling sees only fresh output.
     LOG_PATH.write_text("")
+    # Persist the URL so `bin/figma-run --restart` can re-launch without args.
+    URL_PATH.write_text(url)
 
     cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--serve", url]
     if email:
@@ -319,7 +820,9 @@ def ensure_server(url: str, email: str = None, password: str = None) -> int:
     log_fh.close()
 
     # Case C (manual login) may need up to 5 min — budget generously.
-    timeout = 360 if manual_login else 150
+    # Auto-login path needs room for Scripter open (≤30s) + hydration probe
+    # retries (≤60s) on a slow file load.
+    timeout = 360 if manual_login else 180
     deadline = time.time() + timeout
 
     print(
@@ -329,7 +832,11 @@ def ensure_server(url: str, email: str = None, password: str = None) -> int:
 
     while time.time() < deadline:
         text = LOG_PATH.read_text() if LOG_PATH.exists() else ""
-        if "Scripter opened." in text:
+        # "Ready." is only printed after Scripter opens AND the hydration
+        # probe confirms Figma's file has loaded (children populated or
+        # confirmed empty). Waiting on "Scripter opened." alone was
+        # reporting ready before Figma finished loading the file.
+        if "Ready. Send code" in text:
             print("server ready")
             return 0
         if "could not open Scripter" in text:
