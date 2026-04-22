@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# figma-run-smoketest — asserts that print() output from a Scripter script
+# reaches figma-run's stdout. Run after changing run.py or bin/figma-run.
+#
+# Exits 0 on success, 1 on missing output, 2 on invocation errors.
+
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FIGMA_RUN="$HERE/figma-run"
+
+if [[ ! -x "$FIGMA_RUN" ]]; then
+  echo "error: $FIGMA_RUN not found or not executable" >&2
+  exit 2
+fi
+
+SCRIPT="$(mktemp -t smoketest-XXXXXX.js)"
+trap 'rm -f "$SCRIPT"' EXIT
+
+TS="$(date +%s%N)"
+MARKER="smoketest:$TS"
+
+# Scripter's source transform adds an implicit ``return`` before the last
+# expression. If the last expression starts with an identifier like
+# ``print``, the transform sometimes produces ``returnprint(...)`` (no
+# space) when the code was installed programmatically. Wrapping in an IIFE
+# sidesteps that transform — which is what real build scripts always do.
+cat > "$SCRIPT" <<JS
+(async () => {
+  print("$MARKER");
+})();
+JS
+
+echo "running smoketest → expecting '$MARKER' in stdout"
+OUT="$("$FIGMA_RUN" "$SCRIPT" 2>&1)"
+rc=$?
+
+echo "$OUT"
+echo "---"
+
+if echo "$OUT" | grep -q "$MARKER"; then
+  echo "✓ smoketest PASS"
+  exit 0
+else
+  echo "✗ smoketest FAIL: '$MARKER' not found in figma-run stdout"
+  echo "  figma-run exit code: $rc"
+  exit 1
+fi

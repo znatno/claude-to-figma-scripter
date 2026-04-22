@@ -2,6 +2,8 @@
 
 AI-driven Figma design automation. Any LLM coding assistant writes Figma Plugin API scripts, a persistent Playwright/Firefox session pastes them into the Scripter plugin, and the result appears on the Figma canvas.
 
+> **To build UI:** write JS to `/tmp/<name>.js`, run `./bin/figma-run /tmp/<name>.js`, read `result.png`. That's the entire loop.
+
 > **AI agents:** read [`AGENTS.md`](AGENTS.md) — tool-agnostic workflow usable from Claude Code, Cursor, Aider, Windsurf, Continue.dev, Copilot, or any model API client.
 
 ## How it works

@@ -66,8 +66,7 @@ print("ComponentName|" + Math.round(comp.width) + "x" + Math.round(comp.height))
 ## 2. Verify after Step 1
 
 ```bash
-sleep 4 && cat "$(dirname "$(command -v run.py || echo .)")/output.txt" 2>/dev/null \
-  || cat output.txt
+sleep 4 && cat ./output.txt 2>/dev/null
 ```
 
 Check: name, width, height match expected values from code.

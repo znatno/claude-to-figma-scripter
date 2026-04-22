@@ -10,13 +10,9 @@ Tool-agnostic workflow for any LLM-driven coding assistant (Claude Code, Cursor,
 
 A persistent Playwright/Firefox session logged into Figma with the Scripter plugin open. You write Figma Plugin API JavaScript; the harness pastes it into Scripter and clicks Run; the effect appears on the Figma canvas.
 
-The harness lives at:
+The harness lives at the **project root** (the directory containing `run.py`).
 
-```
-project root
-```
-
-All `run.py` calls below assume the absolute path.
+All `run.py` calls below use paths relative to the project root (`./`).
 
 ---
 
@@ -25,7 +21,7 @@ All `run.py` calls below assume the absolute path.
 When a Figma URL or Figma-work phrase appears in the user's message:
 
 ```bash
-python <PROJECT>/run.py --ensure "<FIGMA_URL>"
+python ./run.py --ensure "<FIGMA_URL>"
 ```
 
 - Idempotent: if the server is already running it prints `server already running` and exits in <1 s. Safe to call every turn.
@@ -41,7 +37,7 @@ Do **not** ask "should I start the server?" — the user already said yes by des
 Before any non-trivial script, **read the full ruleset** at:
 
 ```
-<PROJECT>/scripter.md
+./scripter.md
 ```
 
 Non-negotiables (from `scripter.md`):
@@ -55,10 +51,10 @@ Non-negotiables (from `scripter.md`):
 
 Reference files (read when the pipeline applies):
 
-- `<PROJECT>/scripter.md` — full crash-avoidance ruleset.
-- `<PROJECT>/add-component.md` — component-addition pipeline (Step 1 create → Step 2 bind → Propstar).
-- `<PROJECT>/figma-comments.md` — Figma REST comments workflow.
-- `<PROJECT>/pdf-import.md` — PDF → Figma import pipeline (1 slide = 1 frame).
+- `./scripter.md` — full crash-avoidance ruleset.
+- `./add-component.md` — component-addition pipeline (Step 1 create → Step 2 bind → Propstar).
+- `./figma-comments.md` — Figma REST comments workflow.
+- `./pdf-import.md` — PDF → Figma import pipeline (1 slide = 1 frame).
 
 Target script size **< 5 KB**. If bigger, split.
 
@@ -69,16 +65,25 @@ Target script size **< 5 KB**. If bigger, split.
 Write the script to a file, then:
 
 ```bash
-python <PROJECT>/run.py --file /tmp/script.js
+./bin/figma-run /tmp/script.js
 ```
 
-Outputs:
+The wrapper blocks until the script finishes, then prints the captured `print()` output and closes Scripter so the canvas is visible. Typical output:
 
-- `<PROJECT>/output.txt` — captured `print()` / `figma.notify()` text. Read this for data. *(Note: capture is currently flaky on macOS — the server log still reports OK/Error, and `figma.notify()` toasts are still visible on the screenshot.)*
-- `<PROJECT>/result.png` — full-page screenshot. Only read it when you need visual verification; don't screenshot by default.
-- `/tmp/claude-figma.log` — server log. `tail -n 20 /tmp/claude-figma.log` to confirm the last run printed `OK` or an `Error:`.
+```
+--- output ---
+built: Dialer 390x844, 12 keys, 5 tabs
+--- result ---
+/path/to/result.png
+STATUS=ok
+```
 
-After sending a script, wait a few seconds, then check the log / output.
+- **Changelog:** After every code or documentation change (besides editing this file or `changelog.md`), you **MUST** record it in `changelog.md` under the `## [Unreleased]` header.
+- The `--- output ---` block is the build script's own `print()` text — that *is* the verification. No separate inspect scripts.
+- `STATUS=ok|timeout|error` is the last line — exit code mirrors it.
+- Flags: `--keep-open` (don't close Scripter after — rare, only when chaining scripts that depend on Scripter state), `--restart [URL]` (kill + re-ensure first; URL overrides the saved one).
+- `./result.png` — full-page screenshot with Scripter closed. Read it only when you need visual verification.
+- `./bin/figma-run-smoketest` — round-trip test that `print()` output reaches stdout. Run after editing `run.py` or the wrapper.
 
 ---
 
@@ -86,11 +91,11 @@ After sending a script, wait a few seconds, then check the log / output.
 
 ```bash
 # Run any Figma plugin; optionally select an action inside it
-python <PROJECT>/run.py "__plugin__:Propstar > Create property table"
+python ./run.py "__plugin__:Propstar > Create property table"
 
 # After any other plugin, Scripter loses focus — re-open it
 sleep 15
-python <PROJECT>/run.py "__reopen_scripter__"
+python ./run.py "__reopen_scripter__"
 ```
 
 ---
@@ -106,7 +111,7 @@ python <PROJECT>/run.py "__reopen_scripter__"
 ## Session hygiene
 
 - One long-lived Firefox session pinned to one Figma URL. Never kill the browser unless the user asks — disruption = re-login.
-- If the Scripter iframe loses focus: `python <PROJECT>/run.py "__reopen_scripter__"`.
+- If the Scripter iframe loses focus: `python ./run.py "__reopen_scripter__"`.
 - To switch Figma files: `pkill -f "run.py --serve"; rm -f /tmp/claude-figma.fifo`, then `--ensure` with the new URL.
 
 ---

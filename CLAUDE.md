@@ -1,207 +1,72 @@
-# claude-to-figma-scripter — інструкції для Claude Code
+# claude-to-figma-scripter
 
-## Що це
+**To build UI:** write JS to `/tmp/<name>.js`, run `./bin/figma-run /tmp/<name>.js`, read `result.png`. That's the entire workflow.
 
-Малюємо дизайн у Figma через Scripter плагін (Figma Plugin API).
-Правила генерації коду — в `scripter.md` (скіл claude-to-figma-scripter).
+For component-set / variable-binding pipelines (Step 1 / Step 2 / Propstar) read `scripter.md` and `add-component.md`. For one-shot screens, the helper library in the `claude-to-figma-scripter` skill is everything you need.
 
-## run.py — основний спосіб
+## Environment
 
-Окремий Python-процес тримає Firefox з Figma і Scripter.
-
-### Запуск сервера (ідемпотентно — безпечно викликати щоразу)
-
-```bash
-# Без креденшалів — якщо нема .auth-state.json, буде чекати ручного логіну (Google/SSO/2FA — все працює)
-python run.py --ensure FIGMA_URL
-
-# З креденшалами — автозаповнення форми
-python run.py --ensure FIGMA_URL EMAIL PASSWORD
+```
+python      = ./.venv/bin/python
+runner      = ./bin/figma-run            # wraps run.py with the pinned python
+screenshot  = ./result.png               # overwritten on every run
+log tail    = tail -n 20 /tmp/claude-figma.log
+fifo        = /tmp/claude-figma.fifo     # exists ⇔ server is up
+saved url   = /tmp/claude-figma.url      # written by --ensure, read by --restart
 ```
 
-`--ensure` перевіряє `/tmp/claude-figma.fifo`. Якщо сервер уже крутиться — повертає "server already running" за <1с. Інакше — спавнить `--serve` у фоні і чекає "Scripter opened." у `/tmp/claude-figma.log` (до 2.5 хв з креденшалами, до 6 хв при ручному логіні).
+First time per session, start the server (idempotent — instant if already running):
 
-### Виконання коду
-
-```bash
-python run.py "figma plugin api код"        # inline
-python run.py --file script.js              # з файлу (рекомендовано)
+```
+python run.py --ensure '<FIGMA_URL>'
 ```
 
-### Запуск плагінів (Propstar і т.д.)
+## Project map
 
-```bash
-python run.py "__plugin__:Propstar > Create property table"
-python run.py "__reopen_scripter__"   # після плагіна
-```
+- `run.py` — Playwright server: launches Firefox, opens Figma + Scripter, listens on the fifo. Captures `print()` output via console bridge + DOM scrape. Waits for Figma hydration before reporting ready.
+- `bin/figma-run` — pinned-python wrapper. Default: send file, print captured output, close Scripter. Flags: `--restart [URL]` (kill + re-ensure), `--keep-open` (don't close Scripter after). Auto-retries once on timeout.
+- `bin/figma-run-smoketest` — round-trip test that a `print()` line reaches stdout. Run after editing `run.py` or the wrapper.
+- `scripter.md` — deep ruleset (read before any non-trivial script).
+- `add-component.md`, `figma-comments.md`, `pdf-import.md` — pipeline-specific guides.
+- `result.png` — last screenshot. Source of truth for visual verification.
+- Skill: `~/.claude/skills/claude-to-figma-scripter/SKILL.md` — helper library + design defaults.
 
-### Без скріншотів
+## Known issues
 
-Не робити скріншот якщо користувач не просить побачити результат.
-`figma.notify()` в try/catch підтвердить успіх. Сервер виводить "OK".
+- **Scripter paste stacking** — fixed in `run.py` via `set_editor_code`, which replaces the buffer atomically through Monaco's `setValue` API instead of keyboard Cmd+A+Delete+paste. The old approach was unreliable because focus often landed on an inline `print()` content widget, Cmd+A silently no-op'd, and paste concatenated onto the prior buffer — causing duplicate `const` SyntaxErrors that produced stack-trace-only output (no print output) and orphan nodes from the partial prior run. Scripter also has multiple models (one per open tab); the helper picks the active one by matching the rendered `.view-lines` text. If you still see symptoms like that, run `bin/figma-run --restart <script>`.
+- **IIFE wrapping is mandatory.** Scripter rewrites the last expression with an implicit `return` so scripts can end in a bare expression. When we paste via `setValue`, that transform mis-handles scripts that end in a bare `print("…");` and fails with ``'returnprint' is not defined``. Wrapping every script in `(async () => { … })();` makes the transform skip the implicit return entirely. The helper library template and `bin/figma-run-smoketest` already follow this — never paste a bare `print("…");` as a test.
+- **`figma.currentPage` only accepts a `PageNode`.** A top-level frame's `.parent` is often a `SectionNode`, not a page — setting `figma.currentPage = frame.parent` throws `figma.currentPage expects a PageNode`. Walk up first: `let p = node; while (p && p.type !== 'PAGE') p = p.parent;`. Better: don't set `figma.currentPage` at all — the server navigates to the node in the URL after hydration, and scripts should stay on that page. Only set it when you genuinely need to move work to another page, and restore it on exit.
+- **`figma.createFrame()` / `createRectangle()` attach to `figma.currentPage`** by default. If a script errors before appending them to a proper parent, they become orphans on the page — showing up as floating grey rectangles. Prefer patterns that create the frame and immediately append to a known parent, or cleanup by name at the top of the script: `figma.currentPage.children.filter(c => c.name === 'my-thing').forEach(c => c.remove());`.
+- **Emoji-in-Inter renders weird glyphs** — Unicode symbols like ☎ ★ ✓ render as Inter's fallback, not as icons. **Never use emojis or Unicode glyphs as icons.** Use `icon("name")` from the helper library.
+- **`figma.createNodeFromSvg` returns a FRAME** that ignores SVG `width`/`height` — always call `.resize(w, h)` on it.
+- **Browser restarts never wipe Figma file state.** Figma autosaves continuously. If an inspect right after `--restart` shows an empty page, the file hasn't finished loading — wait a few seconds and re-inspect. Do not rebuild. The server's `--ensure` path now waits for a hydration probe (see `output.txt` / log `hydration ok — HYDRATED:N`) before signaling ready, so this should be rare.
+- **URL page enforcement.** `--ensure` parses `node-id=…` out of the URL and runs a post-hydration probe that sets `figma.currentPage` to the node's parent page and scrolls it into view. Without this Figma's stored session state could override the URL's page silently.
 
----
+## Icon sourcing policy
 
-## Ключові правила та як уникати помилок
+1. **Primary:** the inline `ICONS` SVG map in `~/.claude/skills/claude-to-figma-scripter/SKILL.md` (sourced from Lucide). Use via `icon("phone")`, `icon("mic")`, etc.
+2. **Missing icon:** add the SVG markup as a new entry to the `ICONS` map in `SKILL.md`. Source from <https://lucide.dev>.
+3. **Product-specific icon sets** may be bundled rather than stored as individual SVG files. Do not read private app source paths; extend helpers.js from a public SVG source instead.
+4. **Hard no:** emojis, Unicode glyphs (☎ ★ ✓), `figma.createText` for icon characters. Always real SVG.
 
-### 1. Два етапи для складних макетів (ОБОВ'ЯЗКОВО)
+## Verification & Changelog policy
 
-**Проблема:** великий скрипт з `setBoundVariableForPaint` + створення нод падає мовчки, створюються тільки перші кілька елементів, решта зникає без помилки.
+- `result.png` is the source of truth. Read it once. Don't write `dump.js` / `check.js` / `getid.js` scripts.
+- If you need structural info (node ids, dimensions, child count), append `print(summary)` to the build script — the wrapper prints it between `--- output ---` / `--- end output ---`. No second script.
+- The build script must end with one summary line, e.g. `print("built: Dialer 390x844, 12 keys, 5 tabs");` — that *is* the verification.
+- The wrapper closes Scripter after a successful run so `result.png` shows a clean canvas. Pass `--keep-open` if you want Scripter to stay (rare — only when chaining multiple scripts that depend on Scripter state).
+- To confirm capture is working end-to-end, run `bin/figma-run-smoketest` — it prints a timestamped marker and asserts it round-trips through stdout.
+- **Changelog:** After every code or documentation change (besides editing this file or `changelog.md`), you **MUST** record it in `changelog.md` under the `## [Unreleased]` header.
 
-**Рішення:** завжди розділяти на два скрипти:
-1. **Скрипт 1** — створити ВСЮ візуальну структуру з хардкод RGB кольорами
-2. **Скрипт 2** — пройтись по нодах через `findOne/findAll` і прив'язати змінні
+## Code style for generated Scripter JS
 
-**Чому:** якщо binding впаде, візуал вже створений і не втрачається. Кожен крок можна перевірити окремо.
+- No minified or single-letter identifiers outside loop counters. `screen`, `keypadRow` — not `S`, `KR`.
+- Always paste the helper library (`COLOR`, `SPACE`, `RADIUS`, `TYPE`, `loadFont`, `frame`, `text`, `ICONS`, `icon`) verbatim from the skill at the top of every script.
+- Wrap the body in `(async () => { try { … } catch (e) { figma.notify("Script failed: " + e.message, {error:true}); console.error(e); } })();`
+- End with `figma.currentPage.selection = [screen]; figma.viewport.scrollAndZoomIntoView([screen]); print("built: …");`
+- **Do NOT** call `figma.closePlugin()` yourself — the wrapper closes Scripter after each run so the canvas is visible in `result.png`. Calling it yourself races output capture and may hide the `print("built: …")` summary.
+- Output JS only when a tool is going to paste it — no markdown fences, no commentary.
 
-### 2. Прив'язка змінних до fills/strokes
+## Figma comments
 
-**Проблема:** `node.setBoundVariable("fills", 0, v)` кидає помилку:
-`"fills and strokes variable bindings must be set on paints directly"`
-
-**Рішення:** використовувати `figma.variables.setBoundVariableForPaint()`:
-```ts
-const f = JSON.parse(JSON.stringify(node.fills));
-f[0] = figma.variables.setBoundVariableForPaint(f[0], "color", v);
-node.fills = f;
-```
-
-**Чому `JSON.parse(JSON.stringify(...))`:** `node.fills` повертає frozen array — пряма мутація кидає `Cannot assign to read only property`.
-
-**Для числових пропертів** (radius, width, height, padding) — `setBoundVariable` працює нормально:
-```ts
-node.setBoundVariable("topLeftRadius", v);
-```
-
-Детально — `scripter.md`, Rule 7.
-
-### 3. Перевірка результату після кожного скрипта
-
-**Проблема:** `output.txt` часто не оновлюється (Scripter output panel кешує старий вивід). Дивишся на нього і думаєш що скрипт не спрацював, або навпаки.
-
-**Рішення:**
-- `figma.notify("msg")` — завжди видно на скріншоті (зелена/червона панель внизу)
-- Окремий dump-скрипт для верифікації структури (print дерева нод)
-- `tail -N /tmp/claude-figma.log` — сервер друкує "OK" або "Error" після кожного виконання
-- Скріншот (`result.png`) — останній засіб, якщо все інше не працює
-
-### 4. Іменування нод для Step 2
-
-**Проблема:** в Step 2 (binding) потрібно знайти конкретні ноди. Без імен — неможливо.
-
-**Рішення:** в Step 1 давати осмислені `name` кожному фрейму/прямокутнику:
-```ts
-row.name = "Semantic";        // findOne(n => n.name === "Semantic")
-swatch.name = "Primary";      // findOne(n => n.name === "Primary")
-pill.name = "Blue";            // findOne(n => n.name === "Blue")
-```
-
-### 5. Propstar після кожного Component Set
-
-**Проблема:** без Propstar Component Set — це вертикальна стрічка з 100+ варіантів, в якій нічого не зрозуміло.
-
-**Рішення:** після `figma.combineAsVariants()` обов'язково:
-```bash
-# 1. Виділити компонент (через Scripter)
-python run.py --file select_component.js
-
-# 2. Запустити Propstar
-python run.py "__plugin__:Propstar > Create property table"
-
-# 3. Зачекати ~15с, потім перевідкрити Scripter
-sleep 15
-python run.py "__reopen_scripter__"
-```
-
-**Що робить Propstar:** розкладає всі варіанти в сітку по properties (Variant × Size × State), підписує рядки і колонки.
-
-### 6. Перезапуск сервера
-
-**Проблема:** `pkill -f "run.py --serve"` з наступним стартом часто дає `exit code 144`.
-
-**Рішення:** використовуй `--ensure` замість голого `--serve` — він сам робить startup + readiness polling:
-```bash
-# Зупинити (може дати 144 — це ОК)
-pkill -f "run.py --serve" 2>/dev/null; sleep 2; rm -f /tmp/claude-figma.fifo
-
-# Запустити знову (блокує поки не стане ready)
-python run.py --ensure "FIGMA_URL"
-```
-
-`--ensure` чекає появи "Scripter opened." у `/tmp/claude-figma.log` і повертає керування тільки коли сервер готовий. На Linux додай `DISPLAY=:99` перед командою.
-
-### 7. Розмір скриптів
-
-**Проблема:** дуже великі скрипти (>8KB) можуть мовчки обрізатись при clipboard paste в Scripter.
-
-**Рішення:**
-- Використовувати `--file` замість inline коду
-- Якщо скрипт >5KB — розбити на кілька менших
-- Мінімізувати код: короткі імена змінних, без зайвих пробілів
-- Хелпери (`bF`, `bS`, `bN`) замість повних викликів
-
-### 8. Радіуси в Aethra DS: --radius = 4px
-
-**Проблема:** `rounded-lg` за замовчуванням в Tailwind = 8px, але в цій дизайн-системі `--radius: 0.25rem` = 4px. Тому `rounded-lg = var(--radius) = 4px`.
-
-**Таблиця:**
-- `rounded` (Tailwind default) = `var(--radius)` = **4px** → використати `radius/lg`
-- `rounded-sm` = `calc(var(--radius) - 4px)` = **0px** → `radius/sm`
-- `rounded-md` = `calc(var(--radius) - 2px)` = **2px** → `radius/md`
-- `rounded-lg` = `var(--radius)` = **4px** → `radius/lg` (НЕ 8px!)
-- `rounded-xl` = `calc(var(--radius) + 4px)` = **8px** → `radius/xl`
-
-**Як перевіряти:** через Playwright `getComputedStyle(el).borderRadius` на rendered компоненті — це єдине джерело правди для обчислених значень.
-
-### 9. Аудит через Scripter текстом (без скріншотів)
-
-**Як:** запустити скрипт який `print()` дерево нод з розмірами, потім зчитати `output.txt`.
-
-**Важливо:**
-- `print()` в Scripter виводить тільки один виклик (останній перезаписує попередній)
-- Тому збирати все в один `print(lines.join("\\n"))`
-- Символи Unicode (❖) ламають `String()` конкатенацію → санітизувати через `.replace(/[^\\x20-\\x7E]/g, "")`
-
-### 10. Порядок створення Auto Layout фрейму
-
-**Проблема:** `resize()`, `itemSpacing`, `paddingTop` і т.д. ігноруються якщо встановлені ДО `layoutMode`.
-
-**Рішення:** строгий порядок:
-```ts
-const f = figma.createFrame();
-parent.appendChild(f);          // 1. Спочатку додати в дерево
-f.layoutMode = "VERTICAL";      // 2. Потім layoutMode
-f.resize(400, 100);             // 3. Потім розмір
-f.primaryAxisSizingMode = "AUTO"; // 4. Потім sizing mode
-f.itemSpacing = 16;             // 5. Потім spacing/padding
-f.paddingTop = 24;
-```
-
----
-
-## Коментарі Figma
-
-Для читання коментарів використовуй Figma REST API (див. `figma-comments.md`).
-**Потрібен токен** — якщо його немає, попроси користувача:
-
-> Щоб читати коментарі з Figma, мені потрібен REST API токен. Згенеруй на https://www.figma.com/developers/api#access-tokens і скинь сюди.
-
-```bash
-curl -s -H "X-Figma-Token: TOKEN" "https://api.figma.com/v1/files/FILE_KEY/comments"
-```
-
-Фільтруй по `resolved_at` — показуй тільки невирішені.
-
----
-
-## MCP fallback
-
-Якщо run.py недоступний — один `browser_run_code` з clipboard paste + Run.
-
-Firefox: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`
-Профіль зайнятий: `pkill -f "firefox.*mcp-firefox"`
-
-## Браузер
-
-Playwright MCP з Firefox. Конфіг у `.mcp.json`.
-Xvfb віртуальний дисплей (`DISPLAY=:99`) для headed режиму.
+REST API — see `figma-comments.md`. Needs a token; if absent, ask the user for one from <https://www.figma.com/developers/api#access-tokens>.
