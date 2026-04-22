@@ -2,13 +2,25 @@
 # figma-run — execute a Figma Plugin API script via Scripter.
 #
 # Usage:
-#   bin/figma-run <script.js>                     send file, print captured output
-#   bin/figma-run --restart <script.js> [URL]     kill + re-ensure first; URL
-#                                                 overrides the saved one
+#   bin/figma-run <script.js>                     prepend helpers + profile,
+#                                                 send, print captured output
+#   bin/figma-run --restart <script.js> [URL]     kill + re-ensure first;
+#                                                 URL overrides the saved one
 #   bin/figma-run --keep-open <script.js>         don't close Scripter after
+#   bin/figma-run --raw <script.js>               skip helpers/profile prepend
+#                                                 (for internal probes only)
 #
-# Exit status mirrors the script: 0 = STATUS=ok, 1 = STATUS=timeout (after one
-# auto-restart retry) or STATUS=error, 2 = invocation/IO error.
+# Every run expects /tmp/claude-figma.profile.json to exist — Claude writes
+# it after calling AskUserQuestion for font/colors/spacing/radius/typography.
+# The wrapper bakes the resolved profile into `const PROFILE = {...};` at
+# the top of the buffer so helpers.js (COLOR/SPACE/RADIUS/TYPE) picks it up.
+#
+# Fail-fast policy: no auto-restart on timeout. On any non-ok STATUS the
+# wrapper prints the tail of /tmp/claude-figma.log and exits non-zero. Claude
+# must stop and report to the user — never loop-restart the harness.
+#
+# Exit status: 0 = STATUS=ok, 1 = STATUS=timeout or STATUS=error,
+#              2 = invocation/IO error (including missing profile).
 #
 # Reads FIGMA_URL from env as a last-resort fallback for --restart.
 
@@ -17,6 +29,9 @@ set -uo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PROJECT_DIR}/.venv/bin/python"
 RUN_PY="${PROJECT_DIR}/run.py"
+HELPERS="${PROJECT_DIR}/helpers.js"
+PROFILES_DIR="${PROJECT_DIR}/profiles"
+PROFILE_JSON="/tmp/claude-figma.profile.json"
 LOG="/tmp/claude-figma.log"
 FIFO="/tmp/claude-figma.fifo"
 URL_FILE="/tmp/claude-figma.url"
@@ -24,14 +39,16 @@ RESULT="${PROJECT_DIR}/result.png"
 
 restart=0
 keep_open=0
+raw=0
 script=""
 restart_url=""
 for arg in "$@"; do
   case "$arg" in
     --restart)   restart=1 ;;
     --keep-open) keep_open=1 ;;
+    --raw)       raw=1 ;;
     -h|--help)
-      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --*) echo "error: unknown flag: $arg" >&2; exit 2 ;;
@@ -49,7 +66,7 @@ for arg in "$@"; do
 done
 
 if [[ -z "$script" ]]; then
-  echo "usage: figma-run [--restart [URL]] [--keep-open] <script.js>" >&2
+  echo "usage: figma-run [--restart [URL]] [--keep-open] [--raw] <script.js>" >&2
   exit 2
 fi
 if [[ ! -f "$script" ]]; then
@@ -60,6 +77,12 @@ if [[ ! -x "$PYTHON" ]]; then
   echo "error: pinned python missing or not executable: $PYTHON" >&2
   exit 2
 fi
+
+log_tail() {
+  echo "--- last 30 lines of $LOG ---" >&2
+  [[ -f "$LOG" ]] && tail -n 30 "$LOG" >&2 || echo "(no log file)" >&2
+  echo "--- end log tail ---" >&2
+}
 
 do_restart() {
   local url=""
@@ -90,11 +113,89 @@ if [[ ! -p "$FIFO" ]]; then
   exit 2
 fi
 
+# Build the combined buffer: profile + helpers + user script. Skipped in
+# --raw mode (only used by internal hydration/nav probes that must run
+# without the helpers or a required profile).
+if (( raw )); then
+  SEND_PATH="$script"
+else
+  if [[ ! -f "$HELPERS" ]]; then
+    echo "error: helpers.js missing at $HELPERS" >&2
+    exit 2
+  fi
+  if [[ ! -f "$PROFILE_JSON" ]]; then
+    echo "error: no design profile at $PROFILE_JSON" >&2
+    echo "       Claude must ask the user for font / colors / spacing /" >&2
+    echo "       radius / typography via AskUserQuestion and write the" >&2
+    echo "       resolved profile to $PROFILE_JSON before running scripts." >&2
+    echo "       Presets available under $PROFILES_DIR (ios, material, neutral)." >&2
+    exit 2
+  fi
+
+  # Validate profile and bake it as `const PROFILE = {...};` at the top of
+  # a temp file. If the profile specifies a preset ("ios" / "material" /
+  # "neutral") but is otherwise empty, load the preset JSON from disk.
+  # If it's "custom" it must contain all fields itself.
+  SEND_PATH="$(mktemp -t figma-run.XXXXXX).js"
+  trap 'rm -f "$SEND_PATH"' EXIT
+
+  "$PYTHON" - "$PROFILE_JSON" "$PROFILES_DIR" "$HELPERS" "$script" "$SEND_PATH" <<'PY' || exit 2
+import json, os, sys
+profile_path, presets_dir, helpers_path, user_path, out_path = sys.argv[1:6]
+
+with open(profile_path) as f:
+    prof = json.load(f)
+preset = prof.get("preset")
+if preset and preset != "custom":
+    preset_file = os.path.join(presets_dir, f"{preset}.json")
+    if not os.path.isfile(preset_file):
+        print(f"error: unknown preset '{preset}' (no {preset_file})", file=sys.stderr)
+        sys.exit(2)
+    with open(preset_file) as f:
+        base = json.load(f)
+    # shallow-merge user profile on top of preset base
+    for k, v in prof.items():
+        base[k] = v
+    resolved = base
+elif preset == "custom":
+    resolved = prof
+else:
+    print("error: profile missing 'preset' field ('ios' | 'material' | 'neutral' | 'custom')", file=sys.stderr)
+    sys.exit(2)
+
+required = ("fontFamily", "fontWeights", "colors", "spacing", "radius", "typography")
+missing = [k for k in required if k not in resolved]
+if missing:
+    print(f"error: profile missing required fields: {', '.join(missing)}", file=sys.stderr)
+    sys.exit(2)
+
+with open(helpers_path) as f:
+    helpers = f.read()
+with open(user_path) as f:
+    user = f.read()
+
+parts = [
+    "// === auto-prepended by bin/figma-run ===",
+    f"const PROFILE = {json.dumps(resolved, ensure_ascii=False)};",
+    "",
+    "// === helpers.js ===",
+    helpers,
+    "// === user script ===",
+    user,
+]
+with open(out_path, "w") as f:
+    f.write("\n".join(parts))
+PY
+fi
+
 # Print the captured block for this run and echo STATUS=... lastly.
-# Returns 0 on STATUS=ok, 1 otherwise. Writes STATUS to stdout of caller
-# via a file since bash functions can't return strings.
 STATUS_FILE="$(mktemp)"
-trap 'rm -f "$STATUS_FILE"' EXIT
+# Merge cleanup trap: remove temp files on exit.
+if (( raw )); then
+  trap 'rm -f "$STATUS_FILE"' EXIT
+else
+  trap 'rm -f "$STATUS_FILE" "$SEND_PATH"' EXIT
+fi
 
 run_once() {
   # We can't write a mark into the log: the server holds a non-O_APPEND stdout
@@ -105,7 +206,7 @@ run_once() {
   before_size="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
   before_size="${before_size// /}"
 
-  "$PYTHON" "$RUN_PY" --file "$script" >/dev/null || {
+  "$PYTHON" "$RUN_PY" --file "$SEND_PATH" >/dev/null || {
     echo "STATUS=error" > "$STATUS_FILE"
     echo "STATUS=error"
     echo "error: could not send script to server" >&2
@@ -143,19 +244,17 @@ rc=$?
 status="$(cat "$STATUS_FILE" 2>/dev/null | awk -F= '{print $2}')"
 status="${status:-unknown}"
 
-if [[ "$status" == "timeout" ]]; then
-  echo "--- auto-restart (server timed out once) ---" >&2
-  if do_restart "$restart_url" >&2; then
-    run_once
-    rc=$?
-    status="$(cat "$STATUS_FILE" 2>/dev/null | awk -F= '{print $2}')"
-    status="${status:-unknown}"
-  fi
+# Fail-fast: no auto-restart. Dump log tail on non-ok and exit non-zero.
+# Claude must stop and report to the user — see CLAUDE.md "Failure policy".
+if [[ "$status" != "ok" ]]; then
+  echo "--- bin/figma-run: STATUS=$status — not retrying; see log ---" >&2
+  log_tail
+  exit 1
 fi
 
 # Close Scripter so the canvas is visible. Default ON; skip with --keep-open.
-if (( keep_open == 0 )) && [[ "$status" == "ok" ]]; then
+if (( keep_open == 0 )); then
   echo "__close_scripter__" > "$FIFO"
 fi
 
-[[ "$status" == "ok" ]]
+exit 0

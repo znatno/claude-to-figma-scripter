@@ -1,0 +1,36 @@
+{
+  "preset": "ios",
+  "fontFamily": "Inter",
+  "fontWeights": {
+    "regular":  "Regular",
+    "semiBold": "Semi Bold",
+    "bold":     "Bold"
+  },
+  "colors": {
+    "bg":             { "r": 0.949, "g": 0.949, "b": 0.971 },
+    "surface":        { "r": 1,     "g": 1,     "b": 1     },
+    "label":          { "r": 0,     "g": 0,     "b": 0     },
+    "labelSecondary": { "r": 0.24,  "g": 0.24,  "b": 0.26  },
+    "separator":      { "r": 0.235, "g": 0.235, "b": 0.263 },
+    "blue":           { "r": 0,     "g": 0.478, "b": 1     },
+    "green":          { "r": 0.204, "g": 0.78,  "b": 0.349 },
+    "red":            { "r": 1,     "g": 0.231, "b": 0.188 },
+    "orange":         { "r": 1,     "g": 0.584, "b": 0     },
+    "gray":           { "r": 0.557, "g": 0.557, "b": 0.576 },
+    "gray6":          { "r": 0.949, "g": 0.949, "b": 0.971 }
+  },
+  "spacing": { "xs": 4, "s": 8, "m": 12, "base": 16, "l": 20, "xl": 24, "xxl": 32, "section": 44 },
+  "radius":  { "s": 6, "m": 10, "l": 14, "xl": 22, "pill": 999 },
+  "typography": {
+    "largeTitle": { "size": 34, "weight": "Bold",      "lineHeight": 41 },
+    "title1":     { "size": 28, "weight": "Bold",      "lineHeight": 34 },
+    "title2":     { "size": 22, "weight": "Bold",      "lineHeight": 28 },
+    "title3":     { "size": 20, "weight": "Semi Bold", "lineHeight": 25 },
+    "headline":   { "size": 17, "weight": "Semi Bold", "lineHeight": 22 },
+    "body":       { "size": 17, "weight": "Regular",   "lineHeight": 22 },
+    "callout":    { "size": 16, "weight": "Regular",   "lineHeight": 21 },
+    "subhead":    { "size": 15, "weight": "Regular",   "lineHeight": 20 },
+    "footnote":   { "size": 13, "weight": "Regular",   "lineHeight": 18 },
+    "caption1":   { "size": 12, "weight": "Regular",   "lineHeight": 16 }
+  }
+}
