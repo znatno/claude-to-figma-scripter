@@ -408,7 +408,7 @@ async def set_editor_code(page, f4, code: str) -> bool:
     Implicit-return caveat:
       Scripter rewrites a trailing bare expression with ``return``; a script
       ending in ``print("…");`` becomes ``returnprint(…)``. Wrap scripts in
-      ``(async () => { … })();``. CLAUDE.md documents this rule.
+      ``(async () => { … })();``. AGENTS.md documents this rule.
 
     Returns True iff both the model readback AND the visible-DOM readback
     confirm *code* was installed.

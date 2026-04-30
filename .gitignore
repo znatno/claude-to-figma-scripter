@@ -19,6 +19,11 @@ output.txt
 # Local-only project notes
 changelog.md
 
+# Agent-instruction aliases; AGENTS.md is the public source of truth
+CLAUDE.md
+GEMINI.md
+OPENCODE_LOCAL_LLM.md
+
 # IDE
 .vscode/
 .idea/

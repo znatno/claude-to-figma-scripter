@@ -245,7 +245,7 @@ status="$(cat "$STATUS_FILE" 2>/dev/null | awk -F= '{print $2}')"
 status="${status:-unknown}"
 
 # Fail-fast: no auto-restart. Dump log tail on non-ok and exit non-zero.
-# Claude must stop and report to the user — see CLAUDE.md "Failure policy".
+# Agents must stop and report to the user — see AGENTS.md "Failure policy".
 if [[ "$status" != "ok" ]]; then
   echo "--- bin/figma-run: STATUS=$status — not retrying; see log ---" >&2
   log_tail

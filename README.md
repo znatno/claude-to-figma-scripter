@@ -121,7 +121,7 @@ scripter.md         — Code-generation rules for Figma Scripter
 add-component.md    — Universal pipeline for adding components from code to Figma
 pdf-import.md       — Pipeline for importing PDF presentations into Figma
 figma-comments.md   — Figma REST API comments → Scripter edits
-CLAUDE.md           — Session instructions for Claude Code
+AGENTS.md           — Single source of instructions for all AI agents
 plugin/             — Custom Figma plugin (alternative to Scripter)
   code.js           — Plugin backend (eval + print capture)
   ui.html           — Plugin UI (code editor + output)
