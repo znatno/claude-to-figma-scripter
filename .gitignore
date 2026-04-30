@@ -16,6 +16,9 @@ __pycache__/
 *.png
 output.txt
 
+# Local-only project notes
+changelog.md
+
 # IDE
 .vscode/
 .idea/
