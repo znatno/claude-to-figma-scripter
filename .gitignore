@@ -1,10 +1,15 @@
+.venv/
 venv/
 __pycache__/
-*.pyc
+*.py[cod]
 .env
+.env.*
+*.env
+*.env.*
+.DS_Store
 
 # Browser state (contains auth tokens/cookies)
-.auth-state.json
+.auth-state.json*
 .playwright-mcp/
 
 # Runtime artifacts
@@ -20,3 +25,4 @@ output.txt
 
 # Claude Code per-project config (contains absolute paths and permissions)
 .claude/
+.aider*
